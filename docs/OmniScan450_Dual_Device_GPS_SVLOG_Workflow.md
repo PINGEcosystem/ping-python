@@ -121,6 +121,36 @@ If sonar streams do not include nav packets, you can inject your own JSON wrappe
 
 Only use this if you are ready to validate packet structure carefully.
 
+### Headless Raspberry Pi (no SonarView)
+
+If you want to avoid SonarView runtime overhead, `examples/dualOmniscan450Logger.py` now supports ingesting NMEA over UDP and injecting nav packets directly into the shared `.svlog`.
+
+Required inputs:
+- OmniScan stream A endpoint
+- OmniScan stream B endpoint
+- One NMEA UDP feed (for example from `gpsd`, a GNSS receiver bridge, or a relay)
+
+Example command:
+
+```bash
+python examples/dualOmniscan450Logger.py \
+  --port-endpoint 192.168.2.92:51200 \
+  --star-endpoint 192.168.2.93:51200 \
+  --port-protocol udp \
+  --star-protocol udp \
+  --line-name line001 \
+  --log-root logs/omniscan_dual \
+  --start-mm 0 \
+  --length-mm 5000 \
+  --nmea-udp-listen 0.0.0.0:10110 \
+  --nav-rate-hz 5
+```
+
+Notes:
+- Injected nav packets include `message.time_boot_ms`, `message.lat`, `message.lon`, and optional `message.hdg`/`message.alt` when present in NMEA.
+- This path is intended for low-overhead headless deployments and keeps all sonar + nav in one shared log.
+- End-of-run summary reports NMEA sentence counts and merged nav packet coverage.
+
 ## 7) Convert `.svlog` -> PINGMapper inputs
 
 ### With PINGVerter directly

@@ -6,11 +6,16 @@ Dual OmniScan 450 logger (single shared SVLOG).
 Records two OmniScan 450 streams at once (typically port and starboard), writes
 all packets to one shared .svlog, and prints post-run QA including sonar/nav
 packet counts and per-device packet distribution.
+
+Optional: ingest NMEA over UDP and inject navigation JSON wrapper packets into
+the same shared SVLOG so downstream tools can georeference without SonarView.
 """
 
 import argparse
 import json
 import signal
+import socket
+import struct
 import sys
 import threading
 import time
@@ -22,6 +27,11 @@ from brping import Omniscan450
 from brping import definitions
 
 RUNNING = True
+
+
+class RawPacket:
+    def __init__(self, msg_data: bytes):
+        self.msg_data = msg_data
 
 
 class SharedSvlogWriter:
@@ -45,6 +55,250 @@ class SharedSvlogWriter:
             with open(self.log_path, "ab") as handle:
                 handle.write(payload)
                 self.bytes_written += len(payload)
+
+
+class NavState:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.lat_deg: Optional[float] = None
+        self.lon_deg: Optional[float] = None
+        self.alt_m: Optional[float] = None
+        self.hdg_deg: Optional[float] = None
+        self.last_update_monotonic: Optional[float] = None
+        self.valid_sentences = 0
+        self.total_sentences = 0
+
+
+def nmea_checksum_ok(sentence: str) -> bool:
+    if not sentence.startswith("$") or "*" not in sentence:
+        return False
+
+    body, chk = sentence[1:].split("*", 1)
+    chk = chk.strip()
+    if len(chk) < 2:
+        return False
+
+    calc = 0
+    for char in body:
+        calc ^= ord(char)
+
+    try:
+        expected = int(chk[:2], 16)
+    except ValueError:
+        return False
+
+    return calc == expected
+
+
+def parse_nmea_coord(raw: str, hemi: str, is_lat: bool) -> Optional[float]:
+    if not raw or not hemi:
+        return None
+
+    try:
+        value = float(raw)
+    except ValueError:
+        return None
+
+    degrees = int(value / 100)
+    minutes = value - (degrees * 100)
+    dec_deg = degrees + (minutes / 60.0)
+
+    hemi = hemi.upper()
+    if is_lat and hemi not in ("N", "S"):
+        return None
+    if (not is_lat) and hemi not in ("E", "W"):
+        return None
+
+    if hemi in ("S", "W"):
+        dec_deg *= -1.0
+
+    return dec_deg
+
+
+def parse_nmea_sentence(sentence: str, nav_state: NavState) -> None:
+    line = sentence.strip()
+    if not line.startswith("$"):
+        return
+
+    nav_state.total_sentences += 1
+
+    if not nmea_checksum_ok(line):
+        return
+
+    body = line[1:].split("*", 1)[0]
+    fields = body.split(",")
+    if not fields:
+        return
+
+    tag = fields[0].upper()
+
+    lat_deg = None
+    lon_deg = None
+    alt_m = None
+    hdg_deg = None
+
+    # RMC: $GPRMC,time,status,lat,NS,lon,EW,sog,cog,date,...
+    if tag.endswith("RMC") and len(fields) >= 10:
+        status = fields[2].upper() if fields[2] else ""
+        if status == "A":
+            lat_deg = parse_nmea_coord(fields[3], fields[4], is_lat=True)
+            lon_deg = parse_nmea_coord(fields[5], fields[6], is_lat=False)
+            if fields[8]:
+                try:
+                    hdg_deg = float(fields[8])
+                except ValueError:
+                    pass
+
+    # GGA: $GPGGA,time,lat,NS,lon,EW,fix,numsat,hdop,alt,M,...
+    elif tag.endswith("GGA") and len(fields) >= 10:
+        fix = fields[6]
+        if fix and fix != "0":
+            lat_deg = parse_nmea_coord(fields[2], fields[3], is_lat=True)
+            lon_deg = parse_nmea_coord(fields[4], fields[5], is_lat=False)
+            if fields[9]:
+                try:
+                    alt_m = float(fields[9])
+                except ValueError:
+                    pass
+
+    # HDT: $HEHDT,heading,T
+    elif tag.endswith("HDT") and len(fields) >= 2:
+        if fields[1]:
+            try:
+                hdg_deg = float(fields[1])
+            except ValueError:
+                pass
+
+    # VTG: $GPVTG,cog,T,,M,sog_knots,N,sog_kmh,K
+    elif tag.endswith("VTG") and len(fields) >= 2:
+        if fields[1]:
+            try:
+                hdg_deg = float(fields[1])
+            except ValueError:
+                pass
+
+    changed = False
+    now = time.monotonic()
+
+    with nav_state.lock:
+        if lat_deg is not None and lon_deg is not None:
+            nav_state.lat_deg = lat_deg
+            nav_state.lon_deg = lon_deg
+            nav_state.last_update_monotonic = now
+            changed = True
+
+        if alt_m is not None:
+            nav_state.alt_m = alt_m
+            changed = True
+
+        if hdg_deg is not None:
+            # Normalize into [0, 360)
+            nav_state.hdg_deg = hdg_deg % 360.0
+            changed = True
+
+        if changed:
+            nav_state.valid_sentences += 1
+
+
+def build_json_wrapper_packet(payload_obj: Dict[str, object], src_device_id: int = 0) -> RawPacket:
+    json_bytes = json.dumps(payload_obj, separators=(",", ":")).encode("utf-8")
+    msg_id = definitions.OMNISCAN450_JSON_WRAPPER
+
+    packet = bytearray()
+    packet += b"BR"
+    packet += int(len(json_bytes)).to_bytes(2, "little")
+    packet += int(msg_id).to_bytes(2, "little")
+    packet += int(0).to_bytes(1, "little")  # dst_device_id
+    packet += int(src_device_id).to_bytes(1, "little")
+    packet += json_bytes
+
+    checksum = sum(packet) & 0xFFFF
+    packet += struct.pack("<H", checksum)
+
+    return RawPacket(bytes(packet))
+
+
+def nmea_listener_worker(listen_host: str, listen_port: int, nav_state: NavState) -> None:
+    global RUNNING
+
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    sock.bind((listen_host, listen_port))
+    sock.settimeout(0.5)
+
+    print(f"[nmea] listening on udp://{listen_host}:{listen_port}")
+
+    try:
+        while RUNNING:
+            try:
+                data, _ = sock.recvfrom(8192)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+
+            text = data.decode("ascii", errors="ignore")
+            for raw_line in text.replace("\r", "\n").split("\n"):
+                if raw_line.strip():
+                    parse_nmea_sentence(raw_line, nav_state)
+    finally:
+        try:
+            sock.close()
+        except Exception:
+            pass
+
+
+def nav_injector_worker(
+    writer: SharedSvlogWriter,
+    nav_state: NavState,
+    nav_rate_hz: float,
+    src_device_id: int,
+) -> None:
+    global RUNNING
+
+    period_s = 1.0 / nav_rate_hz if nav_rate_hz > 0 else 0.2
+    seq = 0
+    boot_start = time.monotonic()
+
+    while RUNNING:
+        time.sleep(period_s)
+
+        with nav_state.lock:
+            lat = nav_state.lat_deg
+            lon = nav_state.lon_deg
+            alt = nav_state.alt_m
+            hdg = nav_state.hdg_deg
+
+        if lat is None or lon is None:
+            continue
+
+        time_boot_ms = int((time.monotonic() - boot_start) * 1000.0)
+
+        message = {
+            "time_boot_ms": time_boot_ms,
+            "lat": int(round(lat * 1e7)),
+            "lon": int(round(lon * 1e7)),
+        }
+
+        if alt is not None:
+            message["alt"] = int(round(alt * 1000.0))
+            message["relative_alt"] = int(round(alt * 1000.0))
+
+        if hdg is not None:
+            message["hdg"] = int(round(hdg * 100.0))
+
+        payload_obj = {
+            "header": {
+                "system_id": 255,
+                "component_id": 1,
+                "sequence": seq,
+                "type": "nmea_nav",
+            },
+            "message": message,
+        }
+
+        writer.write_message(build_json_wrapper_packet(payload_obj, src_device_id=src_device_id))
+        seq = (seq + 1) % 65536
 
 
 def parse_endpoint(endpoint: str) -> Tuple[str, int]:
@@ -235,6 +489,24 @@ def parse_args() -> argparse.Namespace:
         help="Print live sonar count every N pings per device (0 disables)",
     )
 
+    parser.add_argument(
+        "--nmea-udp-listen",
+        default=None,
+        help="Optional NMEA UDP listen endpoint HOST:PORT (example: 0.0.0.0:10110)",
+    )
+    parser.add_argument(
+        "--nav-rate-hz",
+        type=float,
+        default=5.0,
+        help="Injected nav packet rate (Hz) when --nmea-udp-listen is enabled",
+    )
+    parser.add_argument(
+        "--nav-src-device-id",
+        type=int,
+        default=250,
+        help="src_device_id used for injected nav packets",
+    )
+
     return parser.parse_args()
 
 
@@ -247,6 +519,7 @@ def main() -> int:
     stamp = datetime.now().strftime("%Y-%m-%d-%H-%M")
     combined_log = log_root / args.line_name / f"{args.line_name}_{stamp}.svlog"
     writer = SharedSvlogWriter(combined_log)
+    nav_state = NavState()
 
     # Internal logger disabled because we write to one shared file ourselves.
     port_dev = Omniscan450(logging=False)
@@ -285,6 +558,11 @@ def main() -> int:
             "nav_packets_live": 0,
             "last_ping_number": None,
         },
+        "nav_injected": {
+            "enabled": bool(args.nmea_udp_listen),
+            "valid_sentences": 0,
+            "total_sentences": 0,
+        },
     }
 
     try:
@@ -309,8 +587,28 @@ def main() -> int:
         writer.write_message(port_dev.build_metadata_packet())
         writer.write_message(star_dev.build_metadata_packet())
 
+        aux_threads = []
+
+        if args.nmea_udp_listen:
+            nmea_host, nmea_port = parse_endpoint(args.nmea_udp_listen)
+            nmea_thread = threading.Thread(
+                target=nmea_listener_worker,
+                args=(nmea_host, nmea_port, nav_state),
+                daemon=True,
+            )
+            nav_thread = threading.Thread(
+                target=nav_injector_worker,
+                args=(writer, nav_state, args.nav_rate_hz, args.nav_src_device_id),
+                daemon=True,
+            )
+            nmea_thread.start()
+            nav_thread.start()
+            aux_threads.extend([nmea_thread, nav_thread])
+
         print("Recording dual OmniScan streams to ONE shared SVLOG. Press Ctrl+C to stop.")
         print(f"Combined svlog: {combined_log}")
+        if args.nmea_udp_listen:
+            print(f"[nmea] nav injection enabled from udp://{args.nmea_udp_listen}")
 
         threads = [
             threading.Thread(
@@ -340,6 +638,10 @@ def main() -> int:
         for name, cfg in devices.items():
             stop_device(name, cfg["dev"])
 
+        with nav_state.lock:
+            status["nav_injected"]["valid_sentences"] = nav_state.valid_sentences
+            status["nav_injected"]["total_sentences"] = nav_state.total_sentences
+
         merged_stats = read_svlog_stats(combined_log)
 
         print("\n=== Acquisition Summary ===")
@@ -359,6 +661,13 @@ def main() -> int:
                 last=status.get("star", {}).get("last_ping_number"),
             )
         )
+        if status["nav_injected"]["enabled"]:
+            print(
+                "[nmea] valid_sentences={valid} total_sentences={total}".format(
+                    valid=status["nav_injected"].get("valid_sentences", 0),
+                    total=status["nav_injected"].get("total_sentences", 0),
+                )
+            )
 
         print("\n[combined] post-run svlog QA")
         print(
@@ -395,6 +704,11 @@ def main() -> int:
             "\nNOTE: Shared-log conversion assumes both devices have compatible time bases and distinct channel usage "
             "for clean beam separation downstream."
         )
+        if status["nav_injected"]["enabled"]:
+            print(
+                "NOTE: Injected nav packets are written with message.time_boot_ms/lat/lon (and optional hdg/alt) "
+                "for PINGVerter compatibility."
+            )
 
     return 0
 
